@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kalkulator Sederhana</title>
+  <style>
+    :root { --radius: 14px; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif; background:#f5f6fa; margin:0; padding:2rem; display:flex; min-height:100vh; align-items:center; justify-content:center; }
+    .calc { width: 340px; background:#fff; border-radius: var(--radius); box-shadow: 0 10px 30px rgba(0,0,0,.08); overflow:hidden; }
+    .screen { padding: 1rem; border-bottom: 1px solid #eee; text-align: right; }
+    .screen input { width: 100%; font-size: 2rem; border: none; outline: none; text-align: right; background: transparent; padding: .5rem 0; }
+    .keys { display: grid; grid-template-columns: repeat(4, 1fr); gap: .5rem; padding: .75rem; }
+    .btn { border: 0; padding: 1rem; font-size: 1rem; border-radius: 10px; background:#f1f3f5; cursor:pointer; }
+    .btn:active { transform: translateY(1px); }
+    .btn.op { background:#e9ecef; }
+    .btn.equal { grid-column: span 2; background:#dbe4ff; }
+    .btn.clear { background:#ffd8d8; }
+    footer { text-align:center; font-size:.85rem; color:#6b7280; padding:.5rem 1rem 1rem; }
+  </style>
+</head>
+<body>
+  <div class="calc" role="application" aria-label="Aplikasi Kalkulator">
+    <div class="screen">
+      <input id="display" type="text" value="0" aria-label="Layar kalkulator" inputmode="decimal" readonly>
+    </div>
+    <div class="keys">
+      <button class="btn clear" data-action="clear">C</button>
+      <button class="btn op" data-action="sign">±</button>
+      <button class="btn op" data-action="percent">%</button>
+      <button class="btn op" data-op="÷">÷</button>
+
+      <button class="btn" data-num="7">7</button>
+      <button class="btn" data-num="8">8</button>
+      <button class="btn" data-num="9">9</button>
+      <button class="btn op" data-op="×">×</button>
+
+      <button class="btn" data-num="4">4</button>
+      <button class="btn" data-num="5">5</button>
+      <button class="btn" data-num="6">6</button>
+      <button class="btn op" data-op="-">-</button>
+
+      <button class="btn" data-num="1">1</button>
+      <button class="btn" data-num="2">2</button>
+      <button class="btn" data-num="3">3</button>
+      <button class="btn op" data-op="+">+</button>
+
+      <button class="btn" data-num="0" style="grid-column: span 2;">0</button>
+      <button class="btn" data-num=".">.</button>
+      <button class="btn equal" data-action="equals">=</button>
+    </div>
+    <footer>HTML + CSS + JS</footer>
+  </div>
+
+  <script>
+    const display = document.getElementById('display');
+    let first = null, operator = null, waitingSecond = false;
+
+    function format(n){
+      if (n === "" || isNaN(Number(n))) return "0";
+      const num = Number(n);
+      return Number.isInteger(num) ? num.toString() : num.toString();
+    }
+
+    function setDisplay(val){ display.value = val; }
+
+    function inputDigit(d){
+      if (waitingSecond) { setDisplay(d === "." ? "0." : d); waitingSecond = false; return; }
+      if (display.value === "0" && d !== ".") setDisplay(d);
+      else if (d === "." && display.value.includes(".")) return;
+      else setDisplay(display.value + d);
+    }
+
+    function clearAll(){ first = null; operator = null; waitingSecond = false; setDisplay("0"); }
+
+    function setOperator(op){
+      if (operator && !waitingSecond) { compute(); }
+      first = Number(display.value);
+      operator = op;
+      waitingSecond = true;
+    }
+
+    function compute(){
+      if (operator === null) return;
+      const second = Number(display.value);
+      let result = first;
+      switch(operator){
+        case "+": result = first + second; break;
+        case "-": result = first - second; break;
+        case "×": result = first * second; break;
+        case "÷": result = second === 0 ? "Error" : first / second; break;
+      }
+      setDisplay(result === "Error" ? "Error" : format(result));
+      first = (result === "Error") ? null : Number(display.value);
+      operator = null;
+      waitingSecond = false;
+    }
+
+    function toggleSign(){ if (display.value !== "0") setDisplay(String(Number(display.value) * -1)); }
+    function percent(){ setDisplay(String(Number(display.value) / 100)); }
+
+    document.querySelectorAll('.btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const num = btn.getAttribute('data-num');
+        const op = btn.getAttribute('data-op');
+        const action = btn.getAttribute('data-action');
+
+        if (num !== null) inputDigit(num);
+        else if (op) setOperator(op);
+        else if (action === 'clear') clearAll();
+        else if (action === 'equals') compute();
+        else if (action === 'sign') toggleSign();
+        else if (action === 'percent') percent();
+      });
+    });
+
+    // Keyboard support
+    window.addEventListener('keydown', (e) => {
+      if ((/^[0-9.]$/).test(e.key)) inputDigit(e.key);
+      else if (["+", "-", "*", "/"].includes(e.key)) setOperator(e.key === "*" ? "×" : e.key === "/" ? "÷" : e.key);
+      else if (e.key === "Enter" || e.key === "=") compute();
+      else if (e.key.toLowerCase() === "c") clearAll();
+    });
+  </script>
+</body>
+</html>
