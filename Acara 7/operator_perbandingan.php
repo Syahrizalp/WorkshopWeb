@@ -1,9 +1,9 @@
 <?php
-$a = 10; $b = 20;
+$aku = 10; $kamu = 20;
 
-echo "a == b ? "; var_dump($a == $b); echo "<br>";
-echo "a != b ? "; var_dump($a != $b); echo "<br>";
-echo "a >  b ? "; var_dump($a >  $b); echo "<br>";
-echo "a <  b ? "; var_dump($a <  $b); echo "<br>";
-echo "a >= b ? "; var_dump($a >= $b); echo "<br>";
-echo "a <= b ? "; var_dump($a <= $b); echo "<br>";
+echo "aku == kamu ? "; var_dump($aku == $kamu); echo "<br>";
+echo "aku != kamu ? "; var_dump($aku != $kamu); echo "<br>";
+echo "aku >  kamu ? "; var_dump($aku >  $kamu); echo "<br>";
+echo "aku <  kamu ? "; var_dump($aku <  $kamu); echo "<br>";
+echo "aku >= kamu ? "; var_dump($aku >= $kamu); echo "<br>";
+echo "aku <= kamu ? "; var_dump($aku <= $kamu); echo "<br>";
