@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="id">
+<head><meta charset="utf-8"><title>Operator</title></head>
+<body>
+  <h2>Operator</h2>
+  <pre id="out"></pre>
+  <script>
+    const x = 10, y = 3;
+    const hasil = {
+      tambah: x + y,
+      kurang: x - y,
+      kali: x * y,
+      bagi: x / y,
+      mod: x % y,
+      logika: (x > y) && (y < 5),
+      perbandingan: x === 10
+    };
+    document.getElementById('out').textContent = JSON.stringify(hasil, null, 2);
+  </script>
+</body>
+</html>
