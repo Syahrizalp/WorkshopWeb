@@ -1,6 +1,6 @@
 <?php
 // data user dan password
-$username_benar = "admin";
+$username_benar = "rizal";
 $password_benar = "12345";
 
 // mengambil input dari form
