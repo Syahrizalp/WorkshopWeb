@@ -1,0 +1,2179 @@
+local TeleportService = game:GetService("TeleportService")
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local DataStoreService = game:GetService("DataStoreService")
+local HttpService = game:GetService("HttpService")
+local MemoryStoreService = game:GetService("MemoryStoreService")
+local MessagingService = game:GetService("MessagingService")
+
+-- === CONFIG ===
+local PLACE_ID       = 138927795871813
+local MAX_PLAYERS    = 6
+local MIN_PLAYERS    = 1
+local COUNTDOWN_TIME = 30
+local CLEANUP_INTERVAL = 300
+local MAX_PARTY_AGE = 3600
+local lastUpdateTime = 0
+local UPDATE_DEBOUNCE = 2
+
+-- === DATASTORES ===
+local PARTIES_DATASTORE = DataStoreService:GetDataStore("MatchmakingParties")
+local PLAYER_PARTY_DATASTORE = DataStoreService:GetDataStore("PlayerPartyMapping")
+local RATE_LIMIT_DATASTORE = DataStoreService:GetOrderedDataStore("RateLimit")
+
+-- MemoryStore untuk real-time cross-server communication
+local PARTIES_MEMORYSTORE = MemoryStoreService:GetSortedMap("LiveParties")
+local PARTY_LOCKS = MemoryStoreService:GetSortedMap("PartyLocks")
+local SERVER_COUNTS = MemoryStoreService:GetSortedMap("ServerPlayerCounts")
+
+-- === REMOTE SETUP ===
+local folder = RS:FindFirstChild("RemoteEvents") or Instance.new("Folder", RS)
+folder.Name = "RemoteEvents"
+
+local function MakeRemote(name)
+	local r = folder:FindFirstChild(name)
+	if not r then
+		r = Instance.new("RemoteEvent", folder)
+		r.Name = name
+		print("[Remote] Created RemoteEvent:", name)
+	end
+	return r
+end
+
+local CreateParty    = MakeRemote("CreateParty")
+local JoinParty      = MakeRemote("JoinParty")
+local LeaveParty     = MakeRemote("LeaveParty")
+local StartQueue     = MakeRemote("StartQueue")
+local CancelQueue    = MakeRemote("CancelQueue")
+local UpdateLobby    = MakeRemote("UpdateLobby")
+
+-- === STATE ===
+local soloQueue = {}                 -- array of userIds
+local partyQueue = {}                -- array of party codes
+local parties = {}                   -- parties[code] = {Leader=userId, Members={userId,...}, CreatedAt=os.time()}
+local playerParty = {}               -- playerParty[userId] = code
+local activeLocks = {}               -- Mutex locks
+local rateLimitCache = {}            -- In-memory rate limiting
+
+local countdownActive = false
+local countdownRemaining = 0
+local countdownThread = nil
+local countdownThreadCancelFlag = false
+local lastCountdownBroadcast = 0
+local serverPlayerCount = 0
+local cachedCrossServerCount = 0
+local lastCrossServerUpdate = 0
+
+-- === UTILS ===
+local function DebugPrint(...)
+	print("[Matchmaking DEBUG]", ...)
+end
+
+local function deepCopy(original)
+	local copy = {}
+	for k, v in pairs(original) do
+		if type(v) == "table" then
+			copy[k] = deepCopy(v)
+		else
+			copy[k] = v
+		end
+	end
+	return copy
+end
+
+local function RandomCode()
+	local s = ""
+	for i = 1, 5 do 
+		s = s .. tostring(math.random(0, 9)) 
+	end
+	return s
+end
+
+local function getPlayerFromId(id)
+	return Players:GetPlayerByUserId(id)
+end
+
+local function safeFilter(tbl, fn)
+	local t = {}
+	for _, v in ipairs(tbl) do
+		if fn(v) then table.insert(t, v) end
+	end
+	return t
+end
+
+-- === MEMORYSTORE UTILS ===
+local function AcquirePartyLock(partyCode, timeout)
+	local lockKey = "lock_" .. partyCode
+	local serverId = game.JobId
+	local expireTime = os.time() + (timeout or 8) -- Default 8 detik
+
+	local success, wasLocked = pcall(function()
+		return PARTY_LOCKS:UpdateAsync(lockKey, function(oldValue)
+			-- Check if lock exists and is still valid
+			if oldValue and oldValue.Expires and oldValue.Expires > os.time() then
+				return oldValue -- Lock masih aktif, return old value (tidak acquire)
+			end
+
+			-- Acquire lock baru
+			return {
+				ServerId = serverId,
+				Expires = expireTime,
+				AcquiredAt = os.time()
+			}
+		end, expireTime - os.time() + 5) -- TTL sedikit lebih lama dari expire time
+	end)
+
+	-- Debug info
+	if success then
+		DebugPrint("🔒 Lock attempt for", partyCode, "- Acquired:", wasLocked ~= nil)
+	else
+		DebugPrint("❌ Lock error for", partyCode, ":", wasLocked)
+	end
+
+	return success and wasLocked ~= nil
+end
+
+local function ReleasePartyLock(partyCode)
+	local lockKey = "lock_" .. partyCode
+	pcall(function()
+		PARTY_LOCKS:RemoveAsync(lockKey)
+	end)
+end
+
+local function SyncPartyToMemoryStore(code, partyData)
+	local success, error = pcall(function()
+		return PARTIES_MEMORYSTORE:SetAsync(code, {
+			Leader = partyData.Leader,
+			Members = partyData.Members,
+			MembersData = partyData.MembersData or {},
+			CreatedAt = partyData.CreatedAt,
+			LastUpdated = os.time(),
+			Version = (partyData.Version or 0) + 1,
+			ServerId = game.JobId,
+			InQueue = table.find(partyQueue, code) ~= nil
+		}, 86400) -- TTL 24 jam (86400 detik)
+	end)
+	
+	if not success then
+		warn("[MemoryStore] Failed to sync party", code, ":", error)
+	end
+	return success
+end
+
+local function GetPartyFromMemoryStore(code)
+	local success, data = pcall(function()
+		return PARTIES_MEMORYSTORE:GetAsync(code)
+	end)
+	return success and data or nil
+end
+
+local function RemovePartyFromMemoryStore(code)
+	pcall(function()
+		PARTIES_MEMORYSTORE:RemoveAsync(code)
+	end)
+end
+
+
+-- Mutex Lock System
+local function WithLock(key, callback)
+	while activeLocks[key] do
+		task.wait(0.1)
+	end
+	activeLocks[key] = true
+	local success, result = pcall(callback)
+	activeLocks[key] = nil
+	if not success then 
+		warn("[Lock Error] " .. tostring(result))
+		error(result)
+	end
+	return result
+end
+
+-- Rate Limiting
+local function RateLimitCheck(player, operation)
+	local uid = player.UserId
+	local key = uid .. "_" .. operation
+	local now = os.time()
+
+	-- Check memory cache first - lebih longgar
+	if rateLimitCache[key] then
+		local timeDiff = now - rateLimitCache[key].time
+		if timeDiff < 10 then -- 10 detik window
+			rateLimitCache[key].count = rateLimitCache[key].count + 1
+			if rateLimitCache[key].count > 5 then -- 5 requests per 10 detik
+				return false
+			end
+		else
+			rateLimitCache[key] = {time = now, count = 1}
+		end
+	else
+		rateLimitCache[key] = {time = now, count = 1}
+	end
+	return true
+end
+
+-- DataStore Operations
+local function SaveParty(code, partyData)
+	local success, err = pcall(function()
+		PARTIES_DATASTORE:SetAsync(code, partyData)
+	end)
+	if not success then
+		warn("[DataStore] Failed to save party "..code..": "..err)
+	end
+	return success
+end
+
+local function LoadParty(code)
+	local success, data = pcall(function()
+		return PARTIES_DATASTORE:GetAsync(code)
+	end)
+	return success and data or nil
+end
+
+local function SavePlayerParty(userId, code)
+	local success, err = pcall(function()
+		PLAYER_PARTY_DATASTORE:SetAsync(tostring(userId), code)
+	end)
+	if not success then
+		warn("[DataStore] Failed to save player party mapping: "..err)
+	end
+	return success
+end
+
+local function LoadPlayerParty(userId)
+	local success, data = pcall(function()
+		return PLAYER_PARTY_DATASTORE:GetAsync(tostring(userId))
+	end)
+	return success and data or nil
+end
+
+local function RemovePlayerParty(userId)
+	pcall(function()
+		PLAYER_PARTY_DATASTORE:RemoveAsync(tostring(userId))
+	end)
+end
+
+local function ValidatePartyOperation(player, operation)
+	local uid = player.UserId
+
+	if operation == "join_party" or operation == "create_party" then
+		if not RateLimitCheck(player, operation) then
+			return false, "Please wait a moment before trying again."
+		end
+	end
+
+	if not player:IsDescendantOf(Players) then
+		return false, "Player not in game"
+	end
+
+	return true
+end
+
+-- Hitung total pemain menunggu
+local function countWaiting()
+	-- Clean up invalid entries first
+	soloQueue = safeFilter(soloQueue, function(uid)
+		return getPlayerFromId(uid) ~= nil
+	end)
+
+	partyQueue = safeFilter(partyQueue, function(code)
+		local party = parties[code] or LoadParty(code)
+		return party and #party.Members > 0
+	end)
+
+	local total = #soloQueue
+	for _, code in ipairs(partyQueue) do
+		local p = parties[code]
+		if p then 
+			total = total + #p.Members 
+		end
+	end
+
+	-- Update cache
+	serverPlayerCount = total
+
+	return total
+end
+
+local function ShouldBroadcastCountdown(action, countdown)
+	local now = os.time()
+
+	-- Selalu broadcast untuk Start/Cancel
+	if action == "Start" or action == "Cancel" then
+		return true
+	end
+
+	-- Untuk Tick, broadcast hanya di milestone penting
+	if action == "Tick" then
+		-- Broadcast di: 30, 25, 20, 15, 10, 5, 4, 3, 2, 1
+		local milestones = {30, 25, 20, 15, 10, 5, 4, 3, 2, 1}
+		if table.find(milestones, countdown) then
+			return true
+		end
+
+		-- Atau broadcast setiap 5 detik untuk long countdown
+		if countdown > 10 and countdown % 5 == 0 then
+			return true
+		end
+
+		-- Rate limit: minimum 2 detik antara broadcast non-milestone
+		if (now - lastCountdownBroadcast) < 2 then
+			return false
+		end
+	end
+
+	return true
+end
+
+local function SyncServerPlayerCount()
+	local count = countWaiting()
+	local success = pcall(function()
+		SERVER_COUNTS:SetAsync(game.JobId, {
+			Count = count,
+			Timestamp = os.time(),
+			ServerId = game.JobId
+		}, 60) -- TTL 60 detik
+	end)
+
+	if not success then
+		warn("[MemoryStore] Failed to sync player count")
+	end
+	return success
+end
+
+local function GetTotalWaitingCrossServer()
+	local now = os.time()
+
+	-- Return cached value jika masih fresh (< 3 detik)
+	if (now - lastCrossServerUpdate) < 3 and cachedCrossServerCount > 0 then
+		return cachedCrossServerCount
+	end
+
+	local total = 0
+	local success, serverCounts = pcall(function()
+		return SERVER_COUNTS:GetRangeAsync(Enum.SortDirection.Ascending, 100)
+	end)
+
+	if success and serverCounts then
+		for _, item in ipairs(serverCounts) do
+			local data = item.value
+			-- Only count servers updated in last 20 seconds
+			if data and data.Count and (now - data.Timestamp) < 20 then
+				total = total + data.Count
+				DebugPrint("📊 Server", item.key:sub(1,8), "has", data.Count, "waiting")
+			end
+		end
+
+		cachedCrossServerCount = total
+		lastCrossServerUpdate = now
+	else
+		-- Fallback to local if MemoryStore fails
+		total = countWaiting()
+		DebugPrint("⚠️ MemoryStore failed, using local count:", total)
+	end
+
+	return total
+end
+
+local function BroadcastCountdown(action, countdown)
+	if not ShouldBroadcastCountdown(action, countdown) then
+		return
+	end
+
+	lastCountdownBroadcast = os.time()
+
+	SyncServerPlayerCount()
+
+	local success = pcall(function()
+		MessagingService:PublishAsync("CountdownUpdate", {
+			Action = action,
+			Countdown = countdown or countdownRemaining,
+			TotalWaiting = GetTotalWaitingCrossServer(),
+			SourceServer = game.JobId,
+			Timestamp = os.time()
+		})
+	end)
+
+	if success then
+		DebugPrint("📡 Broadcast countdown:", action, countdown or countdownRemaining, "Total waiting:", GetTotalWaitingCrossServer())
+	else
+		DebugPrint("⚠️ Broadcast failed (rate limit?)")
+	end
+end
+
+-- Buat snapshot lobby untuk dikirim ke client
+local function buildLobbySnapshot()
+	local snap = {}
+
+	-- USE CROSS-SERVER TOTAL
+	snap.TotalWaiting = GetTotalWaitingCrossServer()
+	snap.LocalWaiting = countWaiting() -- Tambahkan info lokal juga
+
+	snap.MatchSize = MAX_PLAYERS
+	snap.Countdown = countdownRemaining
+	snap.Parties = {}
+	snap.SoloCount = #soloQueue
+
+	-- Include player-party mapping
+	snap.PlayerParty = {}
+	for userId, code in pairs(playerParty) do
+		snap.PlayerParty[userId] = code
+	end
+
+	local queuedSet = {}
+	for _, code in ipairs(partyQueue) do queuedSet[code] = true end
+
+	-- Collect ALL parties
+	for code, party in pairs(parties) do
+		if party and #party.Members > 0 then
+			local memberNames = {}
+			for _, uid in ipairs(party.Members) do
+				local pl = getPlayerFromId(uid)
+				if pl then 
+					table.insert(memberNames, pl.Name)
+				else
+					local memberData = party.MembersData and party.MembersData[tostring(uid)]
+					if memberData and memberData.Name then
+						table.insert(memberNames, memberData.Name)
+					else
+						table.insert(memberNames, "Player#"..uid)
+					end
+				end
+			end
+
+			local leaderName = "Unknown"
+			local leaderPlayer = getPlayerFromId(party.Leader)
+			if leaderPlayer then
+				leaderName = leaderPlayer.Name
+			else
+				local leaderData = party.MembersData and party.MembersData[tostring(party.Leader)]
+				if leaderData and leaderData.Name then
+					leaderName = leaderData.Name
+				end
+			end
+
+			table.insert(snap.Parties, {
+				Code = code,
+				LeaderName = leaderName,
+				Members = memberNames,
+				Size = #memberNames,
+				Queued = queuedSet[code] == true,
+				CrossServer = party.ServerId ~= game.JobId,
+				ServerId = party.ServerId,
+				CanJoin = #memberNames < MAX_PLAYERS
+			})
+		end
+	end
+
+	return snap
+end
+
+local function SendLobby()
+	UpdateLobby:FireAllClients(buildLobbySnapshot())
+end
+
+local function StartPartyHeartbeat()
+	task.spawn(function()
+		while true do
+			task.wait(5)
+
+			-- Sync player count
+			SyncServerPlayerCount()
+
+			-- Sync parties
+			for code, party in pairs(parties) do
+				if party.ServerId == game.JobId then
+					SyncPartyToMemoryStore(code, party)
+					DebugPrint("Heartbeat for party", code)
+				end
+			end
+
+			-- Update all clients dengan latest count
+			SendLobby()
+		end
+	end)
+end
+
+-- === MESSAGING SERVICE FOR REAL-TIME UPDATES ===
+local function BroadcastPartyUpdate(action, partyCode, partyData)
+	pcall(function()
+		MessagingService:PublishAsync("PartyUpdates", {
+			Action = action,
+			PartyCode = partyCode,
+			PartyData = partyData,
+			SourceServer = game.JobId,
+			Timestamp = os.time()
+		})
+	end)
+end
+
+local function SubscribeToPartyUpdates()
+	local success, connection = pcall(function()
+		return MessagingService:SubscribeAsync("PartyUpdates", function(message)
+			local data = message.Data
+			local now = os.time()
+
+			-- Debounce updates
+			if now - lastUpdateTime < UPDATE_DEBOUNCE then
+				return
+			end
+			lastUpdateTime = now
+
+			-- Ignore messages from this server
+			if data.SourceServer == game.JobId then
+				return
+			end
+
+			DebugPrint("📨 [CrossServer] Received:", data.Action, data.PartyCode, "from server", data.SourceServer:sub(1,8))
+
+			if data.Action == "PartyCreated" or data.Action == "PartyUpdated" then
+				local existingParty = parties[data.PartyCode]
+				if existingParty and (existingParty.Version or 0) > (data.PartyData.Version or 0) then
+					DebugPrint("⚠️ Ignoring outdated update (local version newer)")
+					return
+				end
+
+				parties[data.PartyCode] = data.PartyData
+				DebugPrint("✅ Party synced:", data.PartyCode, "Members:", #data.PartyData.Members)
+
+				for _, memberId in ipairs(data.PartyData.Members) do
+					if not getPlayerFromId(memberId) or not playerParty[memberId] then
+						playerParty[memberId] = data.PartyCode
+					end
+				end
+
+			elseif data.Action == "MemberJoined" then
+				DebugPrint("👤 Member joined:", data.NewMemberName or "Unknown", "->", data.PartyCode)
+				parties[data.PartyCode] = data.PartyData
+
+				if data.PartyData.InQueue and not table.find(partyQueue, data.PartyCode) then
+					table.insert(partyQueue, data.PartyCode)
+				end
+				
+			elseif data.Action == "LeadershipChanged" then
+				DebugPrint("👑 Leadership changed:", data.PartyCode)
+				DebugPrint("  Old Leader:", data.OldLeaderName or "Unknown")
+				DebugPrint("  New Leader:", data.NewLeaderName or "Unknown")
+
+				parties[data.PartyCode] = data.PartyData
+
+				-- Notify local members
+				if data.PartyData then
+					for _, memberId in ipairs(data.PartyData.Members) do
+						local memberPlayer = getPlayerFromId(memberId)
+						if memberPlayer then
+							task.spawn(function()
+								pcall(function()
+									if memberId == data.NewLeaderId then
+										CreateParty:FireClient(memberPlayer, {
+											Success = true,
+											Message = "You are now the party leader!",
+											Code = data.PartyCode,
+											Promoted = true
+										})
+									else
+										CreateParty:FireClient(memberPlayer, {
+											Success = true,
+											Message = (data.NewLeaderName or "Someone") .. " is now the party leader",
+											Code = data.PartyCode,
+											LeaderChanged = true
+										})
+									end
+								end)
+							end)
+						end
+					end
+				end
+
+			elseif data.Action == "PartyDisbanded" then
+				DebugPrint("💥 Party disbanded:", data.PartyCode)
+
+				-- 🆕 NOTIFY LOCAL MEMBERS
+				if parties[data.PartyCode] then
+					local localParty = parties[data.PartyCode]
+					for _, memberId in ipairs(localParty.Members) do
+						local memberPlayer = getPlayerFromId(memberId)
+						if memberPlayer then
+							task.spawn(function()
+								pcall(function()
+									LeaveParty:FireClient(memberPlayer, {
+										Success = true,
+										Message = "Party disbanded",
+										Disbanded = true,
+										Reason = "CrossServerDisband"
+									})
+								end)
+							end)
+							DebugPrint("  📤 Notified local member:", memberPlayer.Name)
+						end
+
+						-- Clean reference
+						playerParty[memberId] = nil
+						RemovePlayerParty(memberId)
+					end
+				end
+
+				parties[data.PartyCode] = nil
+				partyQueue = safeFilter(partyQueue, function(c) return c ~= data.PartyCode end)
+
+			elseif data.Action == "MemberLeft" then
+				if data.PartyData and #data.PartyData.Members > 0 then
+					parties[data.PartyCode] = data.PartyData
+					DebugPrint("👋 Member left, party updated:", data.PartyCode, "Members:", #data.PartyData.Members)
+				else
+					-- 🆕 PARTY EMPTY - TREAT AS DISBANDED
+					DebugPrint("👋 Last member left, disbanding:", data.PartyCode)
+
+					if parties[data.PartyCode] then
+						local localParty = parties[data.PartyCode]
+						for _, memberId in ipairs(localParty.Members) do
+							local memberPlayer = getPlayerFromId(memberId)
+							if memberPlayer then
+								task.spawn(function()
+									pcall(function()
+										LeaveParty:FireClient(memberPlayer, {
+											Success = true,
+											Message = "Party disbanded - no members",
+											Disbanded = true,
+											Reason = "Empty"
+										})
+									end)
+								end)
+							end
+							playerParty[memberId] = nil
+							RemovePlayerParty(memberId)
+						end
+					end
+
+					parties[data.PartyCode] = nil
+					partyQueue = safeFilter(partyQueue, function(c) return c ~= data.PartyCode end)
+				end
+			end
+
+			-- ALWAYS update UI immediately
+			SendLobby()
+			DebugPrint("🔄 UI Updated after cross-server event")
+		end)
+	end)
+
+	if success then
+		print("✅ Subscribed to cross-server party updates")
+		return connection
+	else
+		warn("❌ Failed to subscribe to party updates:", connection)
+		task.delay(10, SubscribeToPartyUpdates)
+		return nil
+	end
+end
+
+local function SubscribeToMatchStart()
+	local success, connection = pcall(function()
+		return MessagingService:SubscribeAsync("MatchStart", function(message)
+			local data = message.Data
+
+			-- Ignore messages from this server
+			if data.SourceServer == game.JobId then
+				return
+			end
+
+			-- 🆕 CHECK EXPIRATION
+			if data.ExpiresAt and os.time() > data.ExpiresAt then
+				warn("⚠️ Match start signal expired, ignoring")
+				return
+			end
+
+			DebugPrint("🎮 [CrossServer] Match start signal received from", data.SourceServer:sub(1,8))
+
+			-- Check if any of our players are in this match
+			local myPlayers = {}
+			for _, uid in ipairs(data.PlayerIds) do
+				local pl = getPlayerFromId(uid)
+				if pl then
+					table.insert(myPlayers, pl)
+				end
+			end
+
+			if #myPlayers == 0 then
+				return
+			end
+
+			DebugPrint("🚀 Teleporting", #myPlayers, "players to reserved server:", data.ReservedServerCode)
+
+			-- 🆕 VALIDATE RESERVED SERVER CODE
+			if not data.ReservedServerCode or data.ReservedServerCode == "" then
+				warn("❌ Invalid reserved server code received")
+				return
+			end
+
+			-- Teleport dengan delay kecil untuk stabilitas
+			task.wait(0.2)
+
+			-- 🆕 BATCH TELEPORT (lebih reliable)
+			local teleportOptions = Instance.new("TeleportOptions")
+			teleportOptions.ShouldReserveServer = false
+
+			local success, err = pcall(function()
+				TeleportService:TeleportAsync(PLACE_ID, myPlayers, teleportOptions)
+			end)
+
+			if success then
+				DebugPrint("✅ Cross-server batch teleport success")
+			else
+				warn("❌ Cross-server batch teleport failed:", err, "- trying individually")
+
+				-- Fallback individual
+				for _, player in ipairs(myPlayers) do
+					task.spawn(function()
+						task.wait(math.random(1, 10) / 10) -- Stagger 0.1-1s
+
+						local individualSuccess, individualErr = pcall(function()
+							TeleportService:TeleportToPlaceInstance(PLACE_ID, data.ReservedServerCode, player)
+						end)
+
+						if individualSuccess then
+							DebugPrint("✅ Cross-server individual teleport success for", player.Name)
+						else
+							warn("❌ Cross-server individual teleport failed for", player.Name, ":", individualErr)
+						end
+					end)
+				end
+			end
+		end)
+	end)
+
+	if success then
+		print("✅ Subscribed to cross-server match starts")
+		return connection
+	else
+		warn("❌ Failed to subscribe to match starts:", connection)
+		task.delay(10, SubscribeToMatchStart)
+		return nil
+	end
+end
+
+-- === CROSS-SERVER PARTY OPERATIONS ===
+local function CreatePartyCrossServer(player)
+	local uid = player.UserId
+
+	return WithLock("create_party_"..uid, function()
+		-- Check if already in a party (cross-server check)
+		local currentPartyCode = playerParty[uid] or LoadPlayerParty(uid)
+		if currentPartyCode then
+			return {Success=false, Message="Already in a party: "..currentPartyCode}
+		end
+
+		-- Generate unique code dengan MemoryStore checking
+		local code
+		local attempts = 0
+		repeat
+			code = RandomCode()
+			attempts = attempts + 1
+			if attempts > 15 then
+				return {Success=false, Message="Failed to generate unique party code"}
+			end
+		until not (parties[code] or LoadParty(code) or GetPartyFromMemoryStore(code))
+
+		-- Create party data
+		local partyData = {
+			Leader = uid,
+			Members = {uid},
+			CreatedAt = os.time(),
+			MembersData = {
+				[tostring(uid)] = {
+					Name = player.Name,
+					JoinedAt = os.time(),
+					ServerId = game.JobId,
+					PlaceId = game.PlaceId
+				}
+			},
+			Version = 1
+		}
+
+		-- Save ke semua storage systems
+		if SaveParty(code, partyData) and SavePlayerParty(uid, code) and SyncPartyToMemoryStore(code, partyData) then
+			parties[code] = partyData
+			playerParty[uid] = code
+
+			-- Broadcast ke semua server
+			BroadcastPartyUpdate("PartyCreated", code, partyData)
+
+			DebugPrint("🎉 Cross-server party created:", code, "by", player.Name)
+			return {Success=true, Code=code}
+		else
+			return {Success=false, Message="Failed to create party. Please try again."}
+		end
+	end)
+end
+
+local function DiscoverPartyCrossServer(code)
+	local sources = {
+		{"MemoryStore", function() return GetPartyFromMemoryStore(code) end},
+		{"LocalCache", function() return parties[code] end},
+		{"DataStore", function() return LoadParty(code) end}
+	}
+
+	local bestData = nil
+	local highestVersion = -1
+
+	for _, source in ipairs(sources) do
+		local name, checkFunc = source[1], source[2]
+		local success, result = pcall(checkFunc)
+		if success and result then
+			local version = result.Version or 0
+			if version > highestVersion then
+				highestVersion = version
+				bestData = result
+				DebugPrint("Found party", code, "via", name, "version:", version)
+			end
+		end
+	end
+
+	return bestData
+end
+
+local function JoinPartyCrossServer(player, code)
+	local uid = player.UserId
+
+	if not ValidatePartyOperation(player, "join_party") then 
+		return {Success=false, Message="Please wait a moment before trying again."}
+	end
+
+	-- Check if already in a party
+	local currentPartyCode = playerParty[uid] or LoadPlayerParty(uid)
+	if currentPartyCode then
+		if currentPartyCode == code then
+			return {Success=true, Code=code, Message="Already in this party"}
+		end
+		return {Success=false, Message="Already in a party: "..currentPartyCode}
+	end
+
+	-- Enhanced party discovery
+	local partyData = DiscoverPartyCrossServer(code)
+	if not partyData then
+		return {Success=false, Message="Party not found. Code: "..code}
+	end
+
+	local lockAcquired = false
+	for attempt = 1, 3 do
+		lockAcquired = AcquirePartyLock(code, 8) -- Timeout 8 detik
+		if lockAcquired then
+			DebugPrint("✅ Lock acquired for party", code, "attempt", attempt)
+			break
+		end
+		DebugPrint("⏳ Waiting for lock on party", code, "attempt", attempt)
+		if attempt < 3 then
+			task.wait(0.5) -- Tunggu 0.5 detik antara percobaan
+		end
+	end
+
+	if not lockAcquired then
+		return {Success=false, Message="Party is busy. Try again in a moment."}
+	end
+
+	local success, result = pcall(function()
+		-- Reload fresh data setelah dapat lock
+		partyData = DiscoverPartyCrossServer(code)
+		if not partyData then
+			ReleasePartyLock(code)
+			return {Success=false, Message="Party no longer exists"}
+		end
+
+		-- Check if already member
+		if table.find(partyData.Members, uid) then
+			playerParty[uid] = code
+			SavePlayerParty(uid, code)
+			ReleasePartyLock(code)
+			return {Success=true, Code=code, Message="Already in party"}
+		end
+
+		-- Check capacity
+		if #partyData.Members >= MAX_PLAYERS then
+			ReleasePartyLock(code)
+			return {Success=false, Message="Party is full (" .. #partyData.Members .. "/" .. MAX_PLAYERS .. ")"}
+		end
+
+		-- Create updated party data
+		local newData = deepCopy(partyData)
+		table.insert(newData.Members, uid)
+		newData.MembersData = newData.MembersData or {}
+		newData.MembersData[tostring(uid)] = {
+			Name = player.Name,
+			JoinedAt = os.time(),
+			ServerId = game.JobId,
+			PlaceId = game.PlaceId
+		}
+		newData.LastUpdated = os.time()
+		newData.Version = (newData.Version or 0) + 1
+
+		-- Save to all storages
+		local memStoreSuccess = SyncPartyToMemoryStore(code, newData)
+		local dataStoreSuccess = SaveParty(code, newData)
+
+		if memStoreSuccess or dataStoreSuccess then
+			-- Update local state
+			parties[code] = newData
+			playerParty[uid] = code
+			SavePlayerParty(uid, code)
+
+			-- Broadcast update (async)
+			task.spawn(function()
+				for i = 1, 2 do -- Hanya 2 percobaan broadcast
+					local broadcastSuccess = pcall(function()
+						MessagingService:PublishAsync("PartyUpdates", {
+							Action = "MemberJoined",
+							PartyCode = code,
+							PartyData = newData,
+							NewMemberId = uid,
+							NewMemberName = player.Name,
+							SourceServer = game.JobId,
+							Timestamp = os.time()
+						})
+					end)
+					if broadcastSuccess then 
+						DebugPrint("📢 Broadcast success on attempt", i)
+						break 
+					end
+					if i < 2 then task.wait(0.2) end
+				end
+			end)
+
+			DebugPrint("🎯 SUCCESS:", player.Name, "joined party", code, "| Version:", newData.Version)
+
+			-- Update UI immediately
+			task.spawn(SendLobby)
+
+			return {
+				Success=true, 
+				Code=code, 
+				PartySize=#newData.Members, 
+				CrossServer=partyData.ServerId ~= game.JobId
+			}
+		else
+			ReleasePartyLock(code)
+			return {Success=false, Message="Failed to save party data"}
+		end
+	end)
+
+	ReleasePartyLock(code)
+
+	if success then
+		return result
+	else
+		warn("❌ JoinPartyCrossServer error:", result)
+		return {Success=false, Message="Join failed: " .. tostring(result)}
+	end
+end
+
+local function BroadcastQueueUpdate()
+	pcall(function()
+		MessagingService:PublishAsync("QueueUpdate", {
+			TotalWaiting = countWaiting(),
+			SoloCount = #soloQueue,
+			PartyCount = #partyQueue,
+			ServerId = game.JobId,
+			Timestamp = os.time()
+		})
+	end)
+end
+
+local function OnQueueChanged()
+	SyncServerPlayerCount() -- Sync ke MemoryStore
+	BroadcastQueueUpdate() -- Broadcast ke servers lain
+	SendLobby() -- Update clients
+end
+
+-- Subscribe to queue updates
+local function SubscribeToQueueUpdates()
+	local success, connection = pcall(function()
+		return MessagingService:SubscribeAsync("QueueUpdate", function(message)
+			local data = message.Data
+
+			-- Ignore dari server sendiri
+			if data.SourceServer == game.JobId then
+				return
+			end
+
+			DebugPrint("📊 [CrossServer] Queue update from", data.ServerId:sub(1,8), ":", data.TotalWaiting, "waiting")
+
+			-- Force refresh lobby dengan cross-server data
+			task.wait(0.1) -- Small delay untuk MemoryStore sync
+			SendLobby()
+		end)
+	end)
+
+	if success then
+		print("✅ Subscribed to cross-server queue updates")
+		return connection
+	else
+		warn("❌ Failed to subscribe to queue updates:", connection)
+		task.delay(10, SubscribeToQueueUpdates)
+		return nil
+	end
+end
+
+-- === MATCH LOGIC ===
+local function assembleMatch()
+	local selected = {} -- Will store {userId, playerName, serverId}
+	local remaining = MAX_PLAYERS
+	local newPartyQueue = {}
+
+	-- Phase 1: Cari party yang ukurannya persis MAX_PLAYERS (full party)
+	for _, code in ipairs(partyQueue) do
+		local p = parties[code] or GetPartyFromMemoryStore(code)
+		if p and #p.Members == MAX_PLAYERS then
+			for _, uid in ipairs(p.Members) do
+				local memberData = p.MembersData and p.MembersData[tostring(uid)]
+				table.insert(selected, {
+					UserId = uid,
+					Name = memberData and memberData.Name or "Player#"..uid,
+					ServerId = memberData and memberData.ServerId or game.JobId
+				})
+			end
+
+			for _, uid in ipairs(p.Members) do
+				playerParty[uid] = nil
+				RemovePlayerParty(uid)
+			end
+			parties[code] = nil
+			partyQueue = safeFilter(partyQueue, function(c) return c ~= code end)
+			pcall(function() PARTIES_DATASTORE:RemoveAsync(code) end)
+			RemovePartyFromMemoryStore(code)
+			BroadcastPartyUpdate("PartyDisbanded", code, nil)
+
+			DebugPrint("🎯 Full party matched:", code, "Size:", #p.Members)
+			remaining = 0
+			break
+		end
+	end
+
+	-- Phase 2: Jika masih ada slot, ambil party yang lebih kecil
+	if remaining > 0 then
+		for _, code in ipairs(partyQueue) do
+			if table.find(newPartyQueue, code) then continue end
+
+			local p = parties[code] or GetPartyFromMemoryStore(code)
+			if p then
+				local size = #p.Members
+				if size <= remaining then
+					for _, uid in ipairs(p.Members) do
+						local memberData = p.MembersData and p.MembersData[tostring(uid)]
+						table.insert(selected, {
+							UserId = uid,
+							Name = memberData and memberData.Name or "Player#"..uid,
+							ServerId = memberData and memberData.ServerId or game.JobId
+						})
+					end
+					remaining -= size
+
+					-- Clean up party
+					for _, uid in ipairs(p.Members) do
+						playerParty[uid] = nil
+						RemovePlayerParty(uid)
+					end
+					parties[code] = nil
+					partyQueue = safeFilter(partyQueue, function(c) return c ~= code end)
+					pcall(function() PARTIES_DATASTORE:RemoveAsync(code) end)
+					RemovePartyFromMemoryStore(code)
+					BroadcastPartyUpdate("PartyDisbanded", code, nil)
+
+					DebugPrint("🎯 Party matched:", code, "Size:", size, "Remaining slots:", remaining)
+
+					if remaining <= 0 then break end
+				else
+					table.insert(newPartyQueue, code)
+				end
+			end
+		end
+	end
+
+	-- Phase 3: Isi sisa slot dengan solo players (local only)
+	if remaining > 0 then
+		local newSoloQueue = {}
+		for _, uid in ipairs(soloQueue) do
+			if remaining > 0 then
+				local pl = getPlayerFromId(uid)
+				if pl then
+					table.insert(selected, {
+						UserId = uid,
+						Name = pl.Name,
+						ServerId = game.JobId
+					})
+					remaining -= 1
+					DebugPrint("🎯 Solo player matched:", pl.Name, "Remaining slots:", remaining)
+				else
+					table.insert(newSoloQueue, uid)
+				end
+			else
+				table.insert(newSoloQueue, uid)
+			end
+		end
+		soloQueue = newSoloQueue
+	end
+
+	DebugPrint("🎯 Final match selection:", #selected, "players")
+	for i, data in ipairs(selected) do
+		local serverInfo = data.ServerId == game.JobId and "This Server" or "Server: "..data.ServerId:sub(1,8)
+		DebugPrint("  " .. i .. ". " .. data.Name .. " (" .. serverInfo .. ")")
+	end
+
+	return selected
+end
+
+local function TeleportSelected(playerDataList)
+	-- Filter only players in THIS server
+	local playersToTeleport = {}
+	local allPlayerIds = {}
+
+	for _, data in ipairs(playerDataList) do
+		table.insert(allPlayerIds, data.UserId)
+
+		if data.ServerId == game.JobId then
+			local pl = getPlayerFromId(data.UserId)
+			if pl then 
+				table.insert(playersToTeleport, pl)
+			end
+		else
+			DebugPrint("⚠️ Player", data.Name, "is on different server, will be handled by their server")
+		end
+	end
+
+	-- Remove ALL players from queues
+	for _, uid in ipairs(allPlayerIds) do
+		soloQueue = safeFilter(soloQueue, function(id) return id ~= uid end)
+	end
+
+	if #playersToTeleport == 0 then 
+		DebugPrint("⚠️ No local players to teleport")
+		return 
+	end
+
+	countdownActive = false
+	countdownRemaining = 0
+	countdownThreadCancelFlag = true
+
+	DebugPrint("🚀 Teleporting", #playersToTeleport, "LOCAL players (out of", #playerDataList, "total)")
+
+	-- 🆕 IMPROVED: Reserve server dengan retry + validation
+	local reservedServerCode = nil
+	local maxAttempts = 3
+
+	for attempt = 1, maxAttempts do
+		local success, result = pcall(function()
+			return TeleportService:ReserveServer(PLACE_ID)
+		end)
+
+		if success and result and result ~= "" then
+			reservedServerCode = result
+			DebugPrint("✅ Reserved server (attempt " .. attempt .. "):", reservedServerCode)
+			break
+		else
+			warn("❌ Reserve server failed (attempt " .. attempt .. "):", result)
+			if attempt < maxAttempts then
+				task.wait(0.5) -- Wait before retry
+			end
+		end
+	end
+
+	if not reservedServerCode then
+		warn("❌ Failed to reserve server after", maxAttempts, "attempts - using fallback")
+
+		-- 🆕 FALLBACK: Teleport tanpa reserved server (ke public server)
+		for _, player in ipairs(playersToTeleport) do
+			task.spawn(function()
+				local success, err = pcall(function()
+					TeleportService:TeleportAsync(PLACE_ID, {player})
+				end)
+				if not success then
+					warn("❌ Fallback teleport failed for", player.Name, ":", err)
+				else
+					DebugPrint("✅ Fallback teleport for", player.Name)
+				end
+			end)
+		end
+
+		SendLobby()
+		return
+	end
+
+	-- 🆕 BROADCAST IMMEDIATELY (sebelum teleport agar tidak expire)
+	local broadcastSuccess = pcall(function()
+		MessagingService:PublishAsync("MatchStart", {
+			ReservedServerCode = reservedServerCode,
+			PlayerIds = allPlayerIds,
+			SourceServer = game.JobId,
+			Timestamp = os.time(),
+			ExpiresAt = os.time() + 30 -- Reserved server valid ~30 detik
+		})
+	end)
+
+	if not broadcastSuccess then
+		warn("⚠️ Failed to broadcast match start - cross-server players may not teleport")
+	end
+
+	-- 🆕 TELEPORT WITH PROPER ERROR HANDLING
+	local teleportOptions = Instance.new("TeleportOptions")
+	teleportOptions.ShouldReserveServer = false -- Already reserved
+
+	-- Teleport semua player SEKALIGUS (lebih cepat)
+	local success, errorMessage = pcall(function()
+		TeleportService:TeleportAsync(PLACE_ID, playersToTeleport, teleportOptions)
+	end)
+
+	if success then
+		DebugPrint("✅ Batch teleport initiated for", #playersToTeleport, "players")
+	else
+		warn("❌ Batch teleport failed:", errorMessage, "- trying individual teleports")
+
+		-- Fallback: Teleport satu per satu
+		for _, player in ipairs(playersToTeleport) do
+			task.spawn(function()
+				local individualSuccess, individualError = pcall(function()
+					TeleportService:TeleportToPlaceInstance(PLACE_ID, reservedServerCode, player)
+				end)
+
+				if individualSuccess then
+					DebugPrint("✅ Individual teleport success for", player.Name)
+				else
+					warn("❌ Individual teleport failed for", player.Name, ":", individualError)
+					-- Kembalikan ke queue
+					if not table.find(soloQueue, player.UserId) then
+						table.insert(soloQueue, player.UserId)
+					end
+				end
+			end)
+		end
+	end
+
+	SendLobby()
+end
+
+local function TryImmediateMatch()
+	if countWaiting() >= MAX_PLAYERS then
+		DebugPrint("Immediate match assembling...")
+		local selected = assembleMatch()
+		if #selected >= MIN_PLAYERS then 
+			-- 🆕 BROADCAST immediate match (cancel countdown di server lain)
+			pcall(function()
+				MessagingService:PublishAsync("CountdownUpdate", {
+					Action = "Cancel",
+					Reason = "ImmediateMatch",
+					SourceServer = game.JobId,
+					Timestamp = os.time()
+				})
+			end)
+
+			TeleportSelected(selected) 
+		end
+	end
+end
+
+-- Countdown
+local function ResetCountdown()
+	if countdownThread then countdownThreadCancelFlag = true end
+	countdownRemaining = COUNTDOWN_TIME
+	countdownActive = true
+	DebugPrint("⏳ Countdown started:", COUNTDOWN_TIME)
+	countdownThreadCancelFlag = false
+
+	-- 🆕 BROADCAST countdown start ke semua server
+	BroadcastCountdown("Start", COUNTDOWN_TIME)
+
+	countdownThread = task.spawn(function()
+		while countdownRemaining > 0 do
+			if countdownThreadCancelFlag then return end
+
+			-- Cek apakah masih ada cukup pemain setiap detik
+			if countWaiting() < MIN_PLAYERS then
+				DebugPrint("🛑 Countdown cancelled - insufficient players")
+				countdownActive = false
+				countdownRemaining = 0
+
+				-- 🆕 BROADCAST countdown cancel
+				BroadcastCountdown("Cancel", 0)
+				SendLobby()
+				return
+			end
+
+			task.wait(1)
+			countdownRemaining -= 1
+
+			-- 🆕 BROADCAST countdown tick setiap 5 detik (untuk efisiensi)
+			BroadcastCountdown("Tick", countdownRemaining)
+			SendLobby()
+
+			if countWaiting() >= MAX_PLAYERS then
+				local selected = assembleMatch()
+				if #selected >= MIN_PLAYERS then
+					TeleportSelected(selected)
+					return
+				end
+			end
+		end
+
+		DebugPrint("🚀 Countdown finished.")
+		local selected = assembleMatch()
+		if #selected >= MIN_PLAYERS then 
+			TeleportSelected(selected) 
+		else
+			DebugPrint("Not enough players for match:", #selected)
+		end
+		countdownActive = false
+		countdownRemaining = 0
+		SendLobby()
+	end)
+end
+
+local function CheckAndStopCountdown()
+	local waitingCount = countWaiting()
+
+	if countdownActive and waitingCount < MIN_PLAYERS then
+		DebugPrint("🛑 Stopping countdown - not enough players:", waitingCount)
+		countdownThreadCancelFlag = true
+		countdownActive = false
+		countdownRemaining = 0
+
+		-- 🆕 BROADCAST countdown cancel
+		pcall(function()
+			MessagingService:PublishAsync("CountdownUpdate", {
+				Action = "Cancel",
+				SourceServer = game.JobId,
+				Timestamp = os.time()
+			})
+		end)
+
+		SendLobby()
+		return true
+	end
+
+	return false
+end
+
+local function SubscribeToCountdownUpdates()
+	local success, connection = pcall(function()
+		return MessagingService:SubscribeAsync("CountdownUpdate", function(message)
+			local data = message.Data
+
+			if data.SourceServer == game.JobId then
+				return
+			end
+
+			DebugPrint("⏰ [CrossServer] Countdown update:", data.Action, "from server", data.SourceServer:sub(1,8))
+
+			-- 🆕 UPDATE CACHED COUNT
+			if data.TotalWaiting then
+				cachedCrossServerCount = data.TotalWaiting
+				lastCrossServerUpdate = os.time()
+				DebugPrint("📊 Updated cross-server count cache:", data.TotalWaiting)
+			end
+
+			if data.Action == "Start" then
+				if not countdownActive then
+					countdownActive = true
+					countdownRemaining = data.Countdown or COUNTDOWN_TIME
+					countdownThreadCancelFlag = false
+
+					DebugPrint("⏳ Synced countdown start:", countdownRemaining, "seconds")
+
+					countdownThread = task.spawn(function()
+						while countdownRemaining > 0 do
+							if countdownThreadCancelFlag then return end
+
+							task.wait(1)
+							countdownRemaining -= 1
+							SendLobby()
+
+							if countdownRemaining <= 0 then
+								countdownActive = false
+								break
+							end
+						end
+					end)
+				end
+
+			elseif data.Action == "Tick" then
+				if countdownActive then
+					local drift = math.abs(countdownRemaining - (data.Countdown or 0))
+					if drift > 2 then
+						countdownRemaining = data.Countdown or countdownRemaining
+						DebugPrint("🔄 Countdown synced, corrected drift:", drift, "seconds")
+					end
+				end
+
+			elseif data.Action == "Cancel" then
+				if countdownActive then
+					countdownThreadCancelFlag = true
+					countdownActive = false
+					countdownRemaining = 0
+					DebugPrint("🛑 Countdown cancelled by cross-server signal")
+				end
+			end
+
+			SendLobby()
+		end)
+	end)
+
+	if success then
+		print("✅ Subscribed to cross-server countdown updates")
+		return connection
+	else
+		warn("❌ Failed to subscribe to countdown updates:", connection)
+		task.delay(10, SubscribeToCountdownUpdates)
+		return nil
+	end
+end
+
+-- === CLEANUP SYSTEM ===
+
+local function ForceCleanupParty(code, reason)
+	DebugPrint("💣 [FORCE CLEANUP]", code, "Reason:", reason or "manual")
+
+	-- Load party from all sources
+	local party = parties[code] or GetPartyFromMemoryStore(code) or LoadParty(code)
+
+	if party then
+		-- Clean members
+		for _, memberId in ipairs(party.Members) do
+			playerParty[memberId] = nil
+			pcall(function() RemovePlayerParty(memberId) end)
+		end
+	end
+
+	-- Remove from local
+	parties[code] = nil
+	partyQueue = safeFilter(partyQueue, function(c) return c ~= code end)
+
+	-- Remove from all storage (force, no error checking)
+	task.spawn(function()
+		for i = 1, 3 do
+			pcall(function() PARTIES_DATASTORE:RemoveAsync(code) end)
+			pcall(function() RemovePartyFromMemoryStore(code) end)
+			pcall(function() ReleasePartyLock(code) end)
+			task.wait(0.1)
+		end
+	end)
+
+	-- Broadcast
+	pcall(function()
+		BroadcastPartyUpdate("PartyDisbanded", code, nil)
+	end)
+
+	DebugPrint("💣 [FORCE CLEANUP] COMPLETED:", code)
+end
+
+local function StartCleanupTask()
+	task.spawn(function()
+		while true do
+			task.wait(30) -- Check setiap 30 detik (lebih sering)
+
+			local now = os.time()
+			local codesToRemove = {}
+
+			DebugPrint("🧹 [CLEANUP] Starting cleanup scan...")
+
+			for code, party in pairs(parties) do
+				local shouldClean = false
+				local reason = ""
+
+				-- Check 1: Too old (1 hour)
+				if (now - party.CreatedAt > MAX_PARTY_AGE) then
+					shouldClean = true
+					reason = "expired (>1 hour)"
+				end
+
+				-- Check 2: No members
+				if #party.Members == 0 then
+					shouldClean = true
+					reason = "no members"
+				end
+
+				-- Check 3: All members offline (untuk local parties)
+				if party.ServerId == game.JobId then
+					local onlineCount = 0
+					for _, memberId in ipairs(party.Members) do
+						if getPlayerFromId(memberId) then
+							onlineCount = onlineCount + 1
+						end
+					end
+
+					if onlineCount == 0 then
+						shouldClean = true
+						reason = "all members offline (local)"
+					end
+				end
+
+				-- 🆕 Check 4: Stuck in queue with no valid members
+				if table.find(partyQueue, code) then
+					local validMembers = 0
+					for _, memberId in ipairs(party.Members) do
+						if playerParty[memberId] == code then
+							validMembers = validMembers + 1
+						end
+					end
+
+					if validMembers == 0 then
+						shouldClean = true
+						reason = "stuck in queue, no valid members"
+					end
+				end
+
+				-- 🆕 Check 5: Stale (not updated in 5 minutes)
+				if party.LastUpdated and (now - party.LastUpdated > 300) then
+					-- Verify it's really stale
+					local memStoreData = GetPartyFromMemoryStore(code)
+					if not memStoreData or (memStoreData.LastUpdated and (now - memStoreData.LastUpdated > 300)) then
+						shouldClean = true
+						reason = "stale (no update >5 min)"
+					end
+				end
+
+				if shouldClean then
+					table.insert(codesToRemove, {code = code, reason = reason})
+				end
+			end
+
+			-- Execute cleanup
+			for _, item in ipairs(codesToRemove) do
+				ForceCleanupParty(item.code, item.reason)
+			end
+
+			if #codesToRemove > 0 then
+				DebugPrint("🧹 [CLEANUP] Removed", #codesToRemove, "parties")
+				OnQueueChanged()
+			end
+
+			-- Clean solo queue
+			local beforeCount = #soloQueue
+			soloQueue = safeFilter(soloQueue, function(uid)
+				return getPlayerFromId(uid) ~= nil
+			end)
+
+			if #soloQueue < beforeCount then
+				DebugPrint("🧹 [CLEANUP] Removed", beforeCount - #soloQueue, "solo queue entries")
+			end
+
+			-- Clean rate limit cache
+			for key, data in pairs(rateLimitCache) do
+				if (now - data.time) > 300 then
+					rateLimitCache[key] = nil
+				end
+			end
+
+			DebugPrint("🧹 [CLEANUP] Scan completed")
+		end
+	end)
+end
+
+local function StartMemoryStoreSync()
+	task.spawn(function()
+		while true do
+			task.wait(10) -- Every 10 seconds
+
+			-- Fetch all parties from MemoryStore
+			local success, memoryParties = pcall(function()
+				return PARTIES_MEMORYSTORE:GetRangeAsync(Enum.SortDirection.Ascending, 100)
+			end)
+
+			if success and memoryParties then
+				local syncCount = 0
+				for _, item in ipairs(memoryParties) do
+					local code = item.key
+					local partyData = item.value
+
+					-- Update if not in local cache or outdated
+					if not parties[code] or (parties[code].Version or 0) < (partyData.Version or 0) then
+						parties[code] = partyData
+						syncCount = syncCount + 1
+					end
+				end
+
+				if syncCount > 0 then
+					DebugPrint("🔄 Synced", syncCount, "parties from MemoryStore")
+					SendLobby() -- Update UI
+				end
+			end
+		end
+	end)
+end
+
+local function LeavePartyCrossServer(player)
+	local uid = player.UserId
+
+	DebugPrint("🚪 [LEAVE] START - Player:", player.Name, "UID:", uid)
+
+	local code = playerParty[uid] or LoadPlayerParty(uid)
+	DebugPrint("🚪 [LEAVE] Party code:", code or "NONE")
+
+	if not code then
+		DebugPrint("🚪 [LEAVE] Not in any party - SUCCESS")
+		return {Success=true, Message="Not in any party"}
+	end
+
+	-- 🆕 FORCE CANCEL QUEUE IMMEDIATELY
+	local wasInQueue = table.find(partyQueue, code)
+	partyQueue = safeFilter(partyQueue, function(c) return c ~= code end)
+	soloQueue = safeFilter(soloQueue, function(id) return id ~= uid end)
+
+	if wasInQueue then
+		DebugPrint("🚪 [LEAVE] Removed from queue")
+		-- Broadcast cancel
+		pcall(function()
+			MessagingService:PublishAsync("CountdownUpdate", {
+				Action = "Cancel",
+				Reason = "LeaderLeft",
+				SourceServer = game.JobId,
+				Timestamp = os.time()
+			})
+		end)
+	end
+
+	-- Load party data from ALL sources
+	local partyData = parties[code]
+	if not partyData then
+		DebugPrint("🚪 [LEAVE] Loading from MemoryStore...")
+		partyData = GetPartyFromMemoryStore(code)
+	end
+	if not partyData then
+		DebugPrint("🚪 [LEAVE] Loading from DataStore...")
+		partyData = LoadParty(code)
+	end
+
+	if not partyData then
+		DebugPrint("🚪 [LEAVE] Party not found - cleaning orphaned reference")
+		playerParty[uid] = nil
+		RemovePlayerParty(uid)
+		OnQueueChanged()
+		return {Success=true, Message="Party not found, cleaned reference"}
+	end
+
+	DebugPrint("🚪 [LEAVE] Party data loaded. Leader:", partyData.Leader, "Members:", #partyData.Members)
+
+	-- Check if player is leader
+	local isLeader = (partyData.Leader == uid)
+	DebugPrint("🚪 [LEAVE] Is leader:", isLeader)
+
+	if isLeader then
+		-- 🆕 LEADER LEAVING - CHECK IF THERE ARE OTHER MEMBERS
+		local remainingMembers = {}
+		for _, memberId in ipairs(partyData.Members) do
+			if memberId ~= uid then
+				table.insert(remainingMembers, memberId)
+			end
+		end
+
+		if #remainingMembers > 0 then
+			-- 🎉 PROMOTE NEXT MEMBER TO LEADER
+			local newLeaderId = remainingMembers[1]
+			local newLeaderPlayer = getPlayerFromId(newLeaderId)
+			local newLeaderName = "Unknown"
+
+			if newLeaderPlayer then
+				newLeaderName = newLeaderPlayer.Name
+			else
+				local memberData = partyData.MembersData and partyData.MembersData[tostring(newLeaderId)]
+				if memberData and memberData.Name then
+					newLeaderName = memberData.Name
+				end
+			end
+
+			DebugPrint("👑 [LEAVE] PROMOTING NEW LEADER:", newLeaderName, "ID:", newLeaderId)
+
+			-- Update party data
+			local newData = deepCopy(partyData)
+			newData.Leader = newLeaderId
+			newData.Members = remainingMembers
+
+			-- Remove old leader from MembersData
+			if newData.MembersData then
+				newData.MembersData[tostring(uid)] = nil
+			end
+
+			newData.LastUpdated = os.time()
+			newData.Version = (newData.Version or 0) + 1
+			newData.InQueue = false -- Reset queue status when leader changes
+
+			-- Save updated party
+			local saveSuccess = SaveParty(code, newData)
+			local memSuccess = SyncPartyToMemoryStore(code, newData)
+
+			if saveSuccess or memSuccess then
+				parties[code] = newData
+
+				-- Clean old leader reference
+				playerParty[uid] = nil
+				RemovePlayerParty(uid)
+
+				-- Broadcast leadership change
+				pcall(function()
+					MessagingService:PublishAsync("PartyUpdates", {
+						Action = "LeadershipChanged",
+						PartyCode = code,
+						PartyData = newData,
+						OldLeaderId = uid,
+						OldLeaderName = player.Name,
+						NewLeaderId = newLeaderId,
+						NewLeaderName = newLeaderName,
+						SourceServer = game.JobId,
+						Timestamp = os.time()
+					})
+				end)
+
+				-- Notify all members about leadership change
+				for _, memberId in ipairs(newData.Members) do
+					local memberPlayer = getPlayerFromId(memberId)
+					if memberPlayer then
+						task.spawn(function()
+							pcall(function()
+								-- Use a custom notification remote or UpdateLobby
+								if memberId == newLeaderId then
+									-- Notify new leader
+									CreateParty:FireClient(memberPlayer, {
+										Success = true,
+										Message = "You are now the party leader!",
+										Code = code,
+										Promoted = true
+									})
+								else
+									-- Notify other members
+									CreateParty:FireClient(memberPlayer, {
+										Success = true,
+										Message = newLeaderName .. " is now the party leader",
+										Code = code,
+										LeaderChanged = true
+									})
+								end
+							end)
+						end)
+					end
+				end
+
+				DebugPrint("👑 [LEAVE] Leadership transferred successfully!")
+				DebugPrint("  Old Leader:", player.Name)
+				DebugPrint("  New Leader:", newLeaderName)
+				DebugPrint("  Remaining members:", #remainingMembers)
+
+			else
+				warn("❌ Failed to save party with new leader")
+			end
+
+		else
+			-- 🆕 NO OTHER MEMBERS - DISBAND PARTY
+			DebugPrint("👑 [LEAVE] LAST MEMBER - DISBANDING PARTY:", code)
+
+			-- Clean up
+			playerParty[uid] = nil
+			RemovePlayerParty(uid)
+			parties[code] = nil
+
+			-- Remove from storage
+			for attempt = 1, 3 do
+				pcall(function() PARTIES_DATASTORE:RemoveAsync(code) end)
+				pcall(function() RemovePartyFromMemoryStore(code) end)
+				if attempt < 3 then task.wait(0.2) end
+			end
+
+			ReleasePartyLock(code)
+
+			-- Broadcast disband
+			BroadcastPartyUpdate("PartyDisbanded", code, nil)
+
+			DebugPrint("👑 [LEAVE] PARTY DISBANDED (last member left)")
+		end
+
+	else
+		-- 🆕 MEMBER LEAVING (not leader)
+		DebugPrint("👤 [LEAVE] MEMBER LEAVING:", player.Name)
+
+		local newData = deepCopy(partyData)
+		newData.Members = safeFilter(newData.Members, function(v) return v ~= uid end)
+
+		if newData.MembersData then
+			newData.MembersData[tostring(uid)] = nil
+		end
+
+		newData.LastUpdated = os.time()
+		newData.Version = (newData.Version or 0) + 1
+
+		if #newData.Members == 0 then
+			-- Party empty (shouldn't happen but just in case)
+			DebugPrint("  Party now empty - removing")
+			parties[code] = nil
+			pcall(function() PARTIES_DATASTORE:RemoveAsync(code) end)
+			RemovePartyFromMemoryStore(code)
+			BroadcastPartyUpdate("PartyDisbanded", code, nil)
+		else
+			-- Update party
+			DebugPrint("  Updating party -", #newData.Members, "members remaining")
+			SaveParty(code, newData)
+			SyncPartyToMemoryStore(code, newData)
+			parties[code] = newData
+			BroadcastPartyUpdate("MemberLeft", code, newData)
+		end
+
+		playerParty[uid] = nil
+		RemovePlayerParty(uid)
+	end
+
+	-- Force update
+	OnQueueChanged()
+	CheckAndStopCountdown()
+
+	DebugPrint("🚪 [LEAVE] COMPLETED SUCCESSFULLY")
+	return {Success=true, Message="Left party"}
+end
+
+StartQueue.OnServerEvent:Connect(function(player, mode)
+	if not ValidatePartyOperation(player, "start_queue") then 
+		StartQueue:FireClient(player, {Success=false, Message="Rate limit exceeded"})
+		return 
+	end
+
+	local uid = player.UserId
+	mode = mode or "Solo"
+	DebugPrint("StartQueue:", player.Name, mode)
+
+	if mode == "Solo" then
+		if table.find(soloQueue, uid) then return end
+		table.insert(soloQueue, uid)
+	else
+		local code = playerParty[uid] or LoadPlayerParty(uid)
+		local pt = parties[code] or GetPartyFromMemoryStore(code) or LoadParty(code)
+		if not pt or pt.Leader ~= uid then 
+			StartQueue:FireClient(player, {Success=false, Message="Not party leader"})
+			return 
+		end
+
+		pt.InQueue = true
+		SyncPartyToMemoryStore(code, pt)
+		SaveParty(code, pt)
+
+		if table.find(partyQueue, code) then return end
+		table.insert(partyQueue, code)
+	end
+
+	TryImmediateMatch()
+	if countWaiting() >= MIN_PLAYERS and not countdownActive then
+		ResetCountdown()
+	end
+
+	-- Trigger sync
+	OnQueueChanged()
+end)
+
+-- Update CancelQueue handler:
+CancelQueue.OnServerEvent:Connect(function(player)
+	local uid = player.UserId
+	soloQueue = safeFilter(soloQueue, function(v) return v ~= uid end)
+
+	local code = playerParty[uid] or LoadPlayerParty(uid)
+	if code then
+		partyQueue = safeFilter(partyQueue, function(c) return c ~= code end)
+		local pt = parties[code] or GetPartyFromMemoryStore(code)
+		if pt then
+			pt.InQueue = false
+			SyncPartyToMemoryStore(code, pt)
+		end
+	end
+
+	CheckAndStopCountdown()
+
+	-- Trigger sync
+	OnQueueChanged()
+end)
+
+-- === EVENT HANDLERS ===
+CreateParty.OnServerEvent:Connect(function(player, ...)
+	if not ValidatePartyOperation(player, "create_party") then 
+		CreateParty:FireClient(player, {Success=false, Message="Rate limit exceeded"})
+		return 
+	end
+
+	local args = {...}
+	if #args > 0 then
+		warn(`Player {player.Name} sent unexpected arguments to CreateParty`)
+		return
+	end
+
+	local result = CreatePartyCrossServer(player)
+	CreateParty:FireClient(player, result)
+	SendLobby()
+end)
+
+JoinParty.OnServerEvent:Connect(function(player, code)
+	if not ValidatePartyOperation(player, "join_party") then 
+		JoinParty:FireClient(player, {Success=false, Message="Rate limit exceeded"})
+		return 
+	end
+
+	if type(code) ~= "string" then
+		JoinParty:FireClient(player, {Success=false, Message="Invalid party code"})
+		return
+	end
+
+	-- Gunakan cross-server join system
+	local result = JoinPartyCrossServer(player, code)
+	JoinParty:FireClient(player, result)
+
+	-- Beri info tambahan jika party dari server lain
+	if result.Success then
+		local partyData = parties[code] or GetPartyFromMemoryStore(code)
+		if partyData and partyData.ServerId ~= game.JobId then
+			JoinParty:FireClient(player, {
+				Success = true, 
+				Code = code, 
+				Message = "Joined cross-server party! Some members may be in different servers.",
+				CrossServer = true
+			})
+		end
+	end
+
+	SendLobby()
+end)
+
+LeaveParty.OnServerEvent:Connect(function(player)
+	if not ValidatePartyOperation(player, "leave_party") then 
+		LeaveParty:FireClient(player, {Success=false, Message="Rate limit exceeded"})
+		return 
+	end
+
+	local result = LeavePartyCrossServer(player)
+	LeaveParty:FireClient(player, result)
+	CheckAndStopCountdown()
+	SendLobby()
+end)
+
+StartQueue.OnServerEvent:Connect(function(player, mode)
+	if not ValidatePartyOperation(player, "start_queue") then 
+		StartQueue:FireClient(player, {Success=false, Message="Rate limit exceeded"})
+		return 
+	end
+
+	local uid = player.UserId
+	mode = mode or "Solo"
+	DebugPrint("StartQueue:", player.Name, mode)
+
+	if mode == "Solo" then
+		if table.find(soloQueue, uid) then return end
+		table.insert(soloQueue, uid)
+	else
+		local code = playerParty[uid] or LoadPlayerParty(uid)
+		local pt = parties[code] or GetPartyFromMemoryStore(code) or LoadParty(code)
+		if not pt or pt.Leader ~= uid then 
+			StartQueue:FireClient(player, {Success=false, Message="Not party leader"})
+			return 
+		end
+
+		-- Update party data dengan queue status
+		pt.InQueue = true
+		SyncPartyToMemoryStore(code, pt)
+		SaveParty(code, pt)
+
+		if table.find(partyQueue, code) then return end
+		table.insert(partyQueue, code)
+	end
+
+	TryImmediateMatch()
+	if countWaiting() >= MIN_PLAYERS and not countdownActive then
+		ResetCountdown()
+	end
+	SendLobby()
+end)
+
+CancelQueue.OnServerEvent:Connect(function(player)
+	local uid = player.UserId
+
+	DebugPrint("CancelQueue requested by:", player.Name)
+
+	-- Remove from solo queue
+	local wasInSolo = table.find(soloQueue, uid)
+	soloQueue = safeFilter(soloQueue, function(v) return v ~= uid end)
+
+	if wasInSolo then
+		DebugPrint("  Removed from solo queue")
+	end
+
+	-- 🆕 Remove party from queue (untuk leader)
+	local code = playerParty[uid] or LoadPlayerParty(uid)
+	if code then
+		local wasInPartyQueue = table.find(partyQueue, code)
+		partyQueue = safeFilter(partyQueue, function(c) return c ~= code end)
+
+		if wasInPartyQueue then
+			DebugPrint("  Removed party", code, "from queue")
+		end
+
+		-- Update party data
+		local pt = parties[code] or GetPartyFromMemoryStore(code)
+		if pt then
+			pt.InQueue = false
+			SyncPartyToMemoryStore(code, pt)
+			SaveParty(code, pt)
+			DebugPrint("  Updated party InQueue status to false")
+		end
+	end
+
+	CheckAndStopCountdown()
+	OnQueueChanged()
+
+	DebugPrint("✅ CancelQueue completed for", player.Name)
+end)
+
+local DebugRemote = MakeRemote("DebugParty")
+
+-- Update DebugRemote handler
+DebugRemote.OnServerEvent:Connect(function(player, action, code)
+	if action == "force_leave" then
+		-- 🆕 FORCE LEAVE COMMAND
+		DebugPrint("⚠️ FORCE LEAVE requested by", player.Name)
+		local result = LeavePartyCrossServer(player)
+		DebugRemote:FireClient(player, {success = result.Success, message = result.Message})
+
+	elseif action == "force_cleanup_party" and code then
+		-- 🆕 FORCE CLEANUP SPECIFIC PARTY
+		DebugPrint("⚠️ FORCE CLEANUP PARTY requested:", code, "by", player.Name)
+		ForceCleanupParty(code, "manual_debug")
+		DebugRemote:FireClient(player, {success = true, message = "Party cleaned: " .. code})
+
+	elseif action == "force_cleanup_all" then
+		-- Nuclear option
+		DebugPrint("⚠️ FORCE CLEANUP ALL requested by", player.Name)
+
+		local count = 0
+		for code, _ in pairs(parties) do
+			ForceCleanupParty(code, "manual_cleanup_all")
+			count = count + 1
+		end
+
+		soloQueue = {}
+		partyQueue = {}
+		playerParty = {}
+
+		OnQueueChanged()
+		DebugRemote:FireClient(player, {success = true, message = "Cleaned " .. count .. " parties"})
+
+	elseif action == "check_party" and code then
+		local party = DiscoverPartyCrossServer(code)
+		if party then
+			DebugRemote:FireClient(player, {
+				exists = true,
+				members = party.Members,
+				leader = party.Leader,
+				server = party.ServerId,
+				version = party.Version,
+				inQueue = table.find(partyQueue, code) ~= nil,
+				createdAt = party.CreatedAt,
+				lastUpdated = party.LastUpdated
+			})
+		else
+			DebugRemote:FireClient(player, {exists = false})
+		end
+
+	elseif action == "list_parties" then
+		DebugRemote:FireClient(player, {
+			localParties = parties,
+			localPlayerParty = playerParty[player.UserId],
+			soloQueue = #soloQueue,
+			partyQueue = partyQueue,
+			totalWaiting = GetTotalWaitingCrossServer()
+		})
+	end
+end)
+
+-- === PLAYER MANAGEMENT ===
+Players.PlayerRemoving:Connect(function(player)
+	local uid = player.UserId
+
+	-- Remove from solo queue
+	soloQueue = safeFilter(soloQueue, function(v) return v ~= uid end)
+
+	-- Handle party membership dengan cross-server
+	local code = playerParty[uid] or LoadPlayerParty(uid)
+	if code then
+		LeavePartyCrossServer(player) -- Gunakan sistem cross-server yang sudah ada
+	end
+
+	CheckAndStopCountdown()
+	SendLobby()
+end)
+
+-- === INITIALIZATION ===
+task.spawn(function()
+	task.wait(5)
+
+	-- Subscribe to cross-server updates
+	SubscribeToPartyUpdates()
+	SubscribeToMatchStart()
+	SubscribeToCountdownUpdates()
+	SubscribeToQueueUpdates()
+	
+	-- Start heartbeat system
+	StartPartyHeartbeat()
+	StartMemoryStoreSync()
+	SyncServerPlayerCount()
+
+	-- Load existing parties
+	for _, player in ipairs(Players:GetPlayers()) do
+		local uid = player.UserId
+		local code = LoadPlayerParty(uid)
+		if code then
+			local partyData = DiscoverPartyCrossServer(code)
+			if partyData then
+				parties[code] = partyData
+				playerParty[uid] = code
+				DebugPrint("✅ Loaded party for", player.Name, "->", code)
+			else
+				RemovePlayerParty(uid)
+				DebugPrint("❌ Cleaned orphaned reference for", player.Name)
+			end
+		end
+	end
+
+	local success, memoryParties = pcall(function()
+		return PARTIES_MEMORYSTORE:GetRangeAsync(Enum.SortDirection.Ascending, 100)
+	end)
+
+	if success and memoryParties then
+		for _, item in ipairs(memoryParties) do
+			parties[item.key] = item.value
+			DebugPrint("📥 Initial sync party:", item.key)
+		end
+	end
+
+	-- Send initial lobby snapshot
+	SendLobby()
+
+	DebugPrint("🚀 Enhanced cross-server system initialized!")
+	DebugPrint("📊 Initial parties count:", #parties)
+end)
+
+task.spawn(function()
+	task.wait(2)
+
+	print("=" .. string.rep("=", 50))
+	print("🔍 TELEPORT CONFIGURATION CHECK")
+	print("=" .. string.rep("=", 50))
+	print("Place ID:", PLACE_ID)
+	print("Current Place ID:", game.PlaceId)
+	print("Match:", PLACE_ID == game.PlaceId)
+
+	-- Test reserve server
+	local success, result = pcall(function()
+		return TeleportService:ReserveServer(PLACE_ID)
+	end)
+
+	if success then
+		print("✅ Reserve Server Test: SUCCESS")
+		print("   Reserved Code:", result)
+	else
+		warn("❌ Reserve Server Test: FAILED")
+		warn("   Error:", result)
+		warn("   ⚠️ CHECK GAME SETTINGS!")
+	end
+
+	print("=" .. string.rep("=", 50))
+end)
+
+
+-- Start cleanup task
+StartCleanupTask()
+
+DebugPrint("🚀 MatchmakingServer initialized with FULL CROSS-SERVER support!")
